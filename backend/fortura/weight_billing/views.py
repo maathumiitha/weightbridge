@@ -2,6 +2,7 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from django.conf import settings
 from django.utils import timezone
 from decimal import Decimal
 # ==================== SECURITY IMPORTS ====================
@@ -12,6 +13,7 @@ from .models import (
     Customer, Operator, Vehicle, WeightRecord, AuditLog,
     WeightRecordPhoto, Payment, QRCode, PaymentSlip,
     WeighbridgeConfig, LiveWeightReading, CameraConfig, PrinterConfig,
+    CompanyDetails,
     # New AI Monitoring models
     AIMonitoringConfig, ObjectDetectionLog, UnauthorizedPresenceAlert
 )
@@ -25,6 +27,13 @@ from .serializers import (
     UnauthorizedPresenceAlertSerializer
 )
 from .utils import create_audit_log
+from .services.hardware_services import (
+    CameraHardwareService,
+    PrinterHardwareService,
+    WeighbridgeHardwareService,
+    HardwareIntegrationError,
+    decode_base64_image,
+)
 
 
 # ==================== CUSTOMER VIEWSET WITH SOFT DELETE ====================
@@ -170,29 +179,60 @@ class WeighbridgeConfigViewSet(viewsets.ModelViewSet):
     def test_connection(self, request, pk=None):
         """Test weighbridge connection"""
         config = self.get_object()
+        retries = request.data.get('retries', 1)
+        retry_delay = request.data.get('retry_delay', 0.5)
         
         try:
-            # This would integrate with your serial port library
-            # For now, just update status
+            details = WeighbridgeHardwareService(
+                retries=retries,
+                retry_delay=retry_delay
+            ).test_connection(config)
             config.is_connected = True
             config.last_connected = timezone.now()
             config.connection_status_message = "Connection successful"
             config.save()
+
+            create_audit_log(
+                weight_record=None,
+                action='WEIGHBRIDGE_CONNECTED',
+                request=request,
+                new_values={
+                    'weighbridge': config.name,
+                    'port': config.port,
+                    'baud_rate': config.baud_rate
+                },
+                notes=f'Weighbridge {config.name} connected on {config.port}'
+            )
             
             return Response({
                 'success': True,
                 'message': 'Weighbridge connected successfully',
                 'port': config.port,
+                'details': details,
                 'status': 'connected'
             })
-        except Exception as e:
+        except (HardwareIntegrationError, Exception) as e:
             config.is_connected = False
             config.connection_status_message = str(e)
             config.save()
+
+            create_audit_log(
+                weight_record=None,
+                action='WEIGHBRIDGE_DISCONNECTED',
+                request=request,
+                new_values={
+                    'weighbridge': config.name,
+                    'port': config.port,
+                    'error': str(e),
+                    'error_code': getattr(e, 'code', 'WEIGHBRIDGE_ERROR')
+                },
+                notes=f'Weighbridge {config.name} connection failed on {config.port}'
+            )
             
             return Response({
                 'success': False,
                 'message': f'Connection failed: {str(e)}',
+                'error_code': getattr(e, 'code', 'WEIGHBRIDGE_ERROR'),
                 'status': 'disconnected'
             }, status=status.HTTP_400_BAD_REQUEST)
     
@@ -208,6 +248,250 @@ class WeighbridgeConfigViewSet(viewsets.ModelViewSet):
             'success': True,
             'message': 'Weighbridge disconnected',
             'status': 'disconnected'
+        })
+
+    @action(detail=False, methods=['get'])
+    def hardware_health(self, request):
+        """
+        Unified hardware readiness status.
+        Query params:
+        - deep=true|false (default false): perform physical probe checks
+        - retries=<int> (default 1)
+        - retry_delay=<float_seconds> (default 0.5)
+        """
+        deep = request.query_params.get('deep', 'false').lower() == 'true'
+        retries = int(request.query_params.get('retries', 1))
+        retry_delay = float(request.query_params.get('retry_delay', 0.5))
+
+        overall_ready = True
+        health = {
+            'deep_probe': deep,
+            'checked_at': timezone.now().isoformat(),
+            'weighbridge': None,
+            'cameras': [],
+            'printers': [],
+        }
+
+        wb = WeighbridgeConfig.objects.filter(is_active=True).first()
+        if wb:
+            wb_status = {
+                'id': wb.id,
+                'name': wb.name,
+                'port': wb.port,
+                'connected_flag': wb.is_connected,
+                'ready': wb.is_connected,
+            }
+            if deep:
+                try:
+                    details = WeighbridgeHardwareService(
+                        retries=retries,
+                        retry_delay=retry_delay
+                    ).test_connection(wb)
+                    wb_status['ready'] = True
+                    wb_status['details'] = details
+                except Exception as e:
+                    wb_status['ready'] = False
+                    wb_status['error'] = str(e)
+                    wb_status['error_code'] = getattr(e, 'code', 'WEIGHBRIDGE_ERROR')
+            overall_ready = overall_ready and wb_status.get('ready', False)
+            health['weighbridge'] = wb_status
+        else:
+            health['weighbridge'] = {
+                'ready': False,
+                'error': 'No active weighbridge config found',
+                'error_code': 'WEIGHBRIDGE_CONFIG_MISSING'
+            }
+            overall_ready = False
+
+        camera_qs = CameraConfig.objects.filter(is_active=True).order_by('display_order', 'id')
+        for cam in camera_qs:
+            cam_status = {
+                'id': cam.id,
+                'name': cam.name,
+                'position': cam.position,
+                'connected_flag': cam.is_connected,
+                'ready': cam.is_connected,
+            }
+            if deep:
+                try:
+                    details = CameraHardwareService(
+                        retries=retries,
+                        retry_delay=retry_delay
+                    ).test_connection(cam)
+                    cam_status['ready'] = True
+                    cam_status['details'] = details
+                except Exception as e:
+                    cam_status['ready'] = False
+                    cam_status['error'] = str(e)
+                    cam_status['error_code'] = getattr(e, 'code', 'CAMERA_ERROR')
+            health['cameras'].append(cam_status)
+            overall_ready = overall_ready and cam_status.get('ready', False)
+
+        printer_qs = PrinterConfig.objects.filter(is_active=True).order_by('id')
+        for prn in printer_qs:
+            prn_status = {
+                'id': prn.id,
+                'name': prn.name,
+                'printer_name': prn.printer_name,
+                'connected_flag': prn.is_connected,
+                'ready_flag': bool(prn.is_ready and prn.slip_engine_ready),
+                'ready': bool(prn.is_ready and prn.slip_engine_ready),
+            }
+            if deep:
+                try:
+                    details = PrinterHardwareService(
+                        retries=retries,
+                        retry_delay=retry_delay
+                    ).test_connection(prn)
+                    prn_status['ready'] = True
+                    prn_status['details'] = details
+                except Exception as e:
+                    prn_status['ready'] = False
+                    prn_status['error'] = str(e)
+                    prn_status['error_code'] = getattr(e, 'code', 'PRINTER_ERROR')
+            health['printers'].append(prn_status)
+            overall_ready = overall_ready and prn_status.get('ready', False)
+
+        health['summary'] = {
+            'overall_ready': overall_ready,
+            'camera_count': len(health['cameras']),
+            'printer_count': len(health['printers']),
+            'has_weighbridge': health['weighbridge'] is not None,
+        }
+        return Response(health)
+
+    @action(detail=False, methods=['get'])
+    def automation_health(self, request):
+        """Phase-2 automation runtime health and queue snapshot."""
+        pending_statuses = [
+            'RECORD_SAVED',
+            'FIRST_WEIGHT_PENDING',
+            'FIRST_WEIGHT_STABLE',
+            'VEHICLE_RETURNED',
+            'SECOND_WEIGHT_PENDING',
+            'SECOND_WEIGHT_STABLE',
+            'SECOND_WEIGHT_CAPTURED',
+            'WEIGHTS_CALCULATED',
+            'CHARGES_CALCULATED',
+            'QR_GENERATED',
+            'SLIP_PRINTED',
+        ]
+        pending_records = WeightRecord.objects.filter(
+            is_deleted=False,
+            status__in=pending_statuses
+        )
+        retry_pending_logs = AuditLog.objects.filter(
+            user='System (Automation)',
+            notes__icontains='[AUTOMATION_RETRY_PENDING]'
+        ).order_by('-timestamp')[:50]
+        recent_actions = AuditLog.objects.filter(
+            user='System (Automation)'
+        ).order_by('-timestamp')[:30]
+
+        return Response({
+            'checked_at': timezone.now().isoformat(),
+            'pending_record_count': pending_records.count(),
+            'pending_records': [
+                {
+                    'id': r.id,
+                    'slip_number': r.slip_number,
+                    'status': r.status,
+                    'date': r.date.isoformat() if r.date else None,
+                }
+                for r in pending_records[:30]
+            ],
+            'retry_pending_count': retry_pending_logs.count(),
+            'retry_pending': [
+                {
+                    'record_id': log.weight_record_id,
+                    'slip_number': log.weight_record.slip_number if log.weight_record else None,
+                    'timestamp': log.timestamp.isoformat(),
+                    'notes': log.notes,
+                }
+                for log in retry_pending_logs
+            ],
+            'recent_automation_actions': [
+                {
+                    'action': log.action,
+                    'record_id': log.weight_record_id,
+                    'slip_number': log.weight_record.slip_number if log.weight_record else None,
+                    'timestamp': log.timestamp.isoformat(),
+                    'notes': log.notes,
+                }
+                for log in recent_actions
+            ]
+        })
+
+    @action(detail=False, methods=['get'])
+    def deployment_readiness(self, request):
+        """
+        Phase-4 deployment readiness snapshot.
+        Returns blockers and a one-shot readiness decision.
+        """
+        active_wb = WeighbridgeConfig.objects.filter(is_active=True).first()
+        active_cameras = CameraConfig.objects.filter(is_active=True).count()
+        active_printers = PrinterConfig.objects.filter(is_active=True).count()
+        active_company = CompanyDetails.objects.filter(is_active=True).first()
+
+        whatsapp_configured = bool(
+            getattr(settings, "WHATSAPP_API_URL", "")
+            and getattr(settings, "WHATSAPP_API_TOKEN", "")
+            and getattr(settings, "WHATSAPP_SENDER_ID", "")
+        )
+        whatsapp_mode = "provider" if whatsapp_configured else "virtual"
+
+        blockers = []
+        warnings = []
+
+        if settings.DEBUG:
+            blockers.append("DJANGO_DEBUG is True")
+        if not settings.ALLOWED_HOSTS:
+            blockers.append("DJANGO_ALLOWED_HOSTS is empty")
+        if not active_wb:
+            blockers.append("No active weighbridge configuration")
+        if active_cameras < 1:
+            blockers.append("No active camera configuration")
+        if active_printers < 1:
+            blockers.append("No active printer configuration")
+        if not active_company:
+            blockers.append("No active company details configured")
+        elif not active_company.upi_id:
+            blockers.append("Company UPI ID not configured")
+
+        if whatsapp_mode == "virtual":
+            warnings.append("WhatsApp provider not configured; virtual queue mode is active")
+        if not getattr(settings, "WHATSAPP_AUTO_SEND_ON_SLIP_GENERATE", False):
+            warnings.append("WHATSAPP_AUTO_SEND_ON_SLIP_GENERATE is disabled")
+
+        return Response({
+            "checked_at": timezone.now().isoformat(),
+            "ready_for_production": len(blockers) == 0,
+            "blocker_count": len(blockers),
+            "warning_count": len(warnings),
+            "blockers": blockers,
+            "warnings": warnings,
+            "application": {
+                "debug": settings.DEBUG,
+                "allowed_hosts_count": len(settings.ALLOWED_HOSTS),
+                "cors_allow_all": getattr(settings, "CORS_ALLOW_ALL_ORIGINS", False),
+            },
+            "hardware": {
+                "has_active_weighbridge": bool(active_wb),
+                "active_camera_count": active_cameras,
+                "active_printer_count": active_printers,
+            },
+            "phase3": {
+                "company_upi_configured": bool(active_company and active_company.upi_id),
+                "whatsapp_mode": whatsapp_mode,
+                "whatsapp_auto_send_on_slip_generate": bool(
+                    getattr(settings, "WHATSAPP_AUTO_SEND_ON_SLIP_GENERATE", False)
+                ),
+            },
+            "master_data": {
+                "customers": Customer.objects.filter(is_deleted=False).count(),
+                "vehicles": Vehicle.objects.filter(is_deleted=False).count(),
+                "operators": Operator.objects.filter(is_deleted=False).count(),
+            },
         })
 
 
@@ -240,10 +524,14 @@ class CameraConfigViewSet(viewsets.ModelViewSet):
     def test_connection(self, request, pk=None):
         """Test camera connection"""
         camera = self.get_object()
+        retries = request.data.get('retries', 1)
+        retry_delay = request.data.get('retry_delay', 0.5)
         
         try:
-            # This would integrate with your camera library (OpenCV, etc.)
-            # For now, just update status
+            details = CameraHardwareService(
+                retries=retries,
+                retry_delay=retry_delay
+            ).test_connection(camera)
             camera.is_connected = True
             camera.last_connected = timezone.now()
             camera.connection_status_message = "Camera connected successfully"
@@ -268,9 +556,10 @@ class CameraConfigViewSet(viewsets.ModelViewSet):
                 'camera': camera.name,
                 'position': camera.position,
                 'ai_monitoring_enabled': camera.ai_monitoring_enabled,
+                'details': details,
                 'status': 'connected'
             })
-        except Exception as e:
+        except (HardwareIntegrationError, Exception) as e:
             camera.is_connected = False
             camera.connection_status_message = str(e)
             camera.save()
@@ -290,6 +579,7 @@ class CameraConfigViewSet(viewsets.ModelViewSet):
             return Response({
                 'success': False,
                 'message': f'Camera connection failed: {str(e)}',
+                'error_code': getattr(e, 'code', 'CAMERA_ERROR'),
                 'status': 'disconnected'
             }, status=status.HTTP_400_BAD_REQUEST)
     
@@ -362,6 +652,9 @@ class CameraConfigViewSet(viewsets.ModelViewSet):
         """Manually trigger camera snapshot"""
         camera = self.get_object()
         weight_record_id = request.data.get('weight_record_id')
+        operator_id = request.data.get('operator_id')
+        weight_stage = request.data.get('weight_stage', 'FIRST')
+        caption = request.data.get('caption', '')
         
         if not weight_record_id:
             return Response(
@@ -371,22 +664,51 @@ class CameraConfigViewSet(viewsets.ModelViewSet):
         
         try:
             weight_record = WeightRecord.objects.get(id=weight_record_id)
-            
-            # This would integrate with your camera capture logic
-            # For now, return success
+            operator = None
+            if operator_id:
+                operator = Operator.objects.filter(id=operator_id).first()
+            snapshot_file = CameraHardwareService().capture_snapshot(
+                camera,
+                quality=camera.jpeg_quality,
+            )
+            photo = WeightRecordPhoto.objects.create(
+                weight_record=weight_record,
+                camera=camera,
+                photo=snapshot_file,
+                photo_type='AUTO_SNAPSHOT',
+                weight_stage=weight_stage if weight_stage in ['FIRST', 'SECOND', 'BOTH'] else 'FIRST',
+                is_auto_captured=True,
+                captured_weight=weight_record.current_live_weight,
+                timestamp_added=True,
+                caption=caption or f'Captured from {camera.name}',
+                uploaded_by=operator
+            )
+
+            create_audit_log(
+                weight_record=weight_record,
+                action='PHOTO_AUTO_CAPTURED',
+                request=request,
+                new_values={
+                    'camera': camera.name,
+                    'photo_id': photo.id,
+                    'weight_stage': photo.weight_stage,
+                },
+                notes=f'Snapshot captured from {camera.name} for record {weight_record.slip_number}'
+            )
             
             return Response({
                 'success': True,
                 'message': f'Snapshot captured from {camera.name}',
                 'camera': camera.name,
-                'weight_record': weight_record.slip_number
+                'weight_record': weight_record.slip_number,
+                'photo_id': photo.id
             })
         except WeightRecord.DoesNotExist:
             return Response(
                 {'error': 'Weight record not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
-        except Exception as e:
+        except (HardwareIntegrationError, Exception) as e:
             return Response(
                 {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
@@ -432,10 +754,14 @@ class PrinterConfigViewSet(viewsets.ModelViewSet):
     def test_connection(self, request, pk=None):
         """Test printer connection"""
         printer = self.get_object()
+        retries = request.data.get('retries', 1)
+        retry_delay = request.data.get('retry_delay', 0.5)
         
         try:
-            # This would integrate with your printer library
-            # For now, just update status
+            PrinterHardwareService(
+                retries=retries,
+                retry_delay=retry_delay
+            ).test_connection(printer)
             printer.is_connected = True
             printer.is_ready = True
             printer.slip_engine_ready = True
@@ -461,7 +787,7 @@ class PrinterConfigViewSet(viewsets.ModelViewSet):
                 'status': 'ready',
                 'slip_engine_ready': True
             })
-        except Exception as e:
+        except (HardwareIntegrationError, Exception) as e:
             printer.is_connected = False
             printer.is_ready = False
             printer.connection_status_message = str(e)
@@ -483,6 +809,7 @@ class PrinterConfigViewSet(viewsets.ModelViewSet):
             return Response({
                 'success': False,
                 'message': f'Printer connection failed: {str(e)}',
+                'error_code': getattr(e, 'code', 'PRINTER_ERROR'),
                 'status': 'not_ready'
             }, status=status.HTTP_400_BAD_REQUEST)
     
@@ -498,17 +825,17 @@ class PrinterConfigViewSet(viewsets.ModelViewSet):
             )
         
         try:
-            # This would integrate with your printer library
-            # For now, just update last printed time
+            result = PrinterHardwareService().print_test_page(printer)
             printer.last_printed = timezone.now()
             printer.save()
             
             return Response({
                 'success': True,
                 'message': 'Test page sent to printer',
-                'printer': printer.name
+                'printer': printer.name,
+                'job_id': result.get('job_id')
             })
-        except Exception as e:
+        except (HardwareIntegrationError, Exception) as e:
             return Response(
                 {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
@@ -1474,10 +1801,14 @@ class WeightRecordViewSet(viewsets.ModelViewSet):
                 if camera_id and image_data:
                     try:
                         camera = CameraConfig.objects.get(id=camera_id)
+                        image_file = decode_base64_image(
+                            image_data,
+                            prefix=f"first_weight_cam_{camera_id}"
+                        )
                         photo = WeightRecordPhoto.objects.create(
                             weight_record=weight_record,
                             camera=camera,
-                            photo=image_data,  # You'll need to handle base64 to file conversion
+                            photo=image_file,
                             photo_type='FIRST_WEIGHT',
                             weight_stage='FIRST',
                             is_auto_captured=auto_captured,
@@ -1490,7 +1821,7 @@ class WeightRecordViewSet(viewsets.ModelViewSet):
                             'camera': camera.name,
                             'photo_id': photo.id
                         })
-                    except CameraConfig.DoesNotExist:
+                    except (CameraConfig.DoesNotExist, HardwareIntegrationError):
                         pass
             
             # Create audit log
@@ -1670,10 +2001,14 @@ class WeightRecordViewSet(viewsets.ModelViewSet):
                 if camera_id and image_data:
                     try:
                         camera = CameraConfig.objects.get(id=camera_id)
+                        image_file = decode_base64_image(
+                            image_data,
+                            prefix=f"second_weight_cam_{camera_id}"
+                        )
                         photo = WeightRecordPhoto.objects.create(
                             weight_record=weight_record,
                             camera=camera,
-                            photo=image_data,  # You'll need to handle base64 to file conversion
+                            photo=image_file,
                             photo_type='SECOND_WEIGHT',
                             weight_stage='SECOND',
                             is_auto_captured=auto_captured,
@@ -1686,7 +2021,7 @@ class WeightRecordViewSet(viewsets.ModelViewSet):
                             'camera': camera.name,
                             'photo_id': photo.id
                         })
-                    except CameraConfig.DoesNotExist:
+                    except (CameraConfig.DoesNotExist, HardwareIntegrationError):
                         pass
             
             # Create audit log

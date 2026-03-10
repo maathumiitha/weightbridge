@@ -11,6 +11,7 @@ Usage:
 
 import os
 import django
+import random
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from decimal import Decimal
@@ -27,6 +28,7 @@ from weight_billing.models import (
     WeightRecord,
     AuditLog
 )
+from weight_billing.services.automation_orchestrator import WeighmentAutomationOrchestrator
 
 
 class Command(BaseCommand):
@@ -90,6 +92,49 @@ class WeighbridgeSerialReader:
         self.stability_buffer = []
         self.stability_start_time = None
         self.last_stable_weight = None
+        self.test_counter = 0
+        self.test_target_weight = Decimal("0")
+        self.test_phase = "EMPTY"
+
+    def _next_test_weight(self):
+        """
+        Generate test-mode weights with stable windows so stability logic can trigger.
+        EMPTY -> RAMP_UP -> STABLE -> RAMP_DOWN -> EMPTY
+        """
+        self.test_counter += 1
+
+        if self.test_phase == "EMPTY":
+            if self.test_counter % 8 == 0:
+                self.test_phase = "RAMP_UP"
+                self.test_target_weight = Decimal(str(random.randint(14000, 36000)))
+                return Decimal(str(random.uniform(100, 600)))
+            return Decimal(str(random.uniform(0, 20)))
+
+        if self.test_phase == "RAMP_UP":
+            # ramp toward target quickly
+            step = Decimal(str(random.uniform(1500, 4500)))
+            current = self.stability_buffer[-1]["weight"] if self.stability_buffer else Decimal("0")
+            next_w = current + step
+            if next_w >= self.test_target_weight:
+                self.test_phase = "STABLE"
+                return self.test_target_weight
+            return next_w
+
+        if self.test_phase == "STABLE":
+            # very small variance (within threshold)
+            if self.test_counter % 10 == 0:
+                self.test_phase = "RAMP_DOWN"
+            return self.test_target_weight + Decimal(str(random.uniform(-0.2, 0.2)))
+
+        if self.test_phase == "RAMP_DOWN":
+            current = self.stability_buffer[-1]["weight"] if self.stability_buffer else self.test_target_weight
+            next_w = current - Decimal(str(random.uniform(1800, 5000)))
+            if next_w <= Decimal("20"):
+                self.test_phase = "EMPTY"
+                return Decimal(str(random.uniform(0, 10)))
+            return next_w
+
+        return Decimal(str(random.uniform(0, 20)))
         
     def log(self, message, style='SUCCESS'):
         """Log message to console"""
@@ -265,75 +310,18 @@ class WeighbridgeSerialReader:
         # Check if we already handled this stable weight
         if self.last_stable_weight == weight:
             return
-        
+
         self.last_stable_weight = weight
-        
-        self.log(f'🎯 STABLE WEIGHT DETECTED: {weight} kg (stable for {stability_duration:.1f}s)')
-        
-        # Find pending weight records
-        pending_records = WeightRecord.objects.filter(
-            status__in=['FIRST_WEIGHT_PENDING', 'SECOND_WEIGHT_PENDING'],
-            is_deleted=False
-        ).order_by('-created_at')
-        
-        if not pending_records.exists():
-            self.log('   No pending weight records found')
-            return
-        
-        record = pending_records.first()
-        
-        # Determine if this is first or second weight
-        if record.status == 'FIRST_WEIGHT_PENDING':
-            # Mark as stable
-            record.detect_first_weight_stable(stability_duration=Decimal(str(stability_duration)))
-            self.log(f'   ✅ First weight stable detected for record {record.slip_number}')
-            
-            # Auto-capture if enabled
-            if self.config.auto_capture_enabled:
-                time.sleep(self.config.auto_capture_delay)
-                record.capture_first_weight(
-                    weight=weight,
-                    operator=record.operator_first_weight,
-                    auto_captured=True
-                )
-                self.log(f'   🤖 First weight AUTO-CAPTURED: {weight} kg')
-                
-                # Log audit
-                AuditLog.objects.create(
-                    weight_record=record,
-                    action='FIRST_WEIGHT_AUTO_CAPTURED',
-                    user='System (Auto-capture)',
-                    new_values={'first_weight': float(weight)},
-                    notes=f'Auto-captured after {stability_duration:.1f}s of stability'
-                )
-        
-        elif record.status == 'SECOND_WEIGHT_PENDING':
-            # Mark as stable
-            record.detect_second_weight_stable(stability_duration=Decimal(str(stability_duration)))
-            self.log(f'   ✅ Second weight stable detected for record {record.slip_number}')
-            
-            # Auto-capture if enabled
-            if self.config.auto_capture_enabled:
-                time.sleep(self.config.auto_capture_delay)
-                record.capture_second_weight(
-                    weight=weight,
-                    operator=record.operator_second_weight or record.operator_first_weight,
-                    auto_captured=True
-                )
-                self.log(f'   🤖 Second weight AUTO-CAPTURED: {weight} kg')
-                
-                # Log audit
-                AuditLog.objects.create(
-                    weight_record=record,
-                    action='SECOND_WEIGHT_AUTO_CAPTURED',
-                    user='System (Auto-capture)',
-                    new_values={'second_weight': float(weight)},
-                    notes=f'Auto-captured after {stability_duration:.1f}s of stability'
-                )
-                
-                # Weights will auto-calculate via WeightRecord.save()
-                self.log(f'   📊 Weights calculated: Gross={record.gross_weight} Tare={record.tare_weight} Net={record.net_weight}')
-    
+        self.log(f'STABLE WEIGHT DETECTED: {weight} kg (stable for {stability_duration:.1f}s)')
+
+        orchestrator = WeighmentAutomationOrchestrator(
+            config=self.config,
+            logger=lambda msg: self.log(msg),
+        )
+        record = orchestrator.process_stable_weight(weight, stability_duration)
+        if record:
+            self.log(f'   Automation updated record {record.slip_number} (status={record.status})')
+
     def read_loop(self):
         """Main reading loop"""
         self.log('🔄 Starting read loop...')
@@ -341,9 +329,8 @@ class WeighbridgeSerialReader:
         while self.is_running:
             try:
                 if self.test_mode:
-                    # Generate test data
-                    import random
-                    weight = Decimal(str(random.randint(10000, 40000)))
+                    # Generate realistic test data with stable windows
+                    weight = self._next_test_weight()
                     line = f"WT: {weight} KG"
                     time.sleep(2)
                 else:
@@ -377,7 +364,7 @@ class WeighbridgeSerialReader:
                 
                 # Update current live weight in pending records
                 pending = WeightRecord.objects.filter(
-                    status__in=['FIRST_WEIGHT_PENDING', 'SECOND_WEIGHT_PENDING'],
+                    status__in=['RECORD_SAVED', 'FIRST_WEIGHT_PENDING', 'FIRST_WEIGHT_STABLE', 'VEHICLE_RETURNED', 'SECOND_WEIGHT_PENDING', 'SECOND_WEIGHT_STABLE'],
                     is_deleted=False
                 ).first()
                 
@@ -436,3 +423,5 @@ class WeighbridgeSerialReader:
                 user='System',
                 notes=f'Disconnected from {self.config.port}'
             )  
+
+

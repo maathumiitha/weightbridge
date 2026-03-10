@@ -1,5 +1,5 @@
 """
-WSGI config for fortura project.
+WSGI config for the weighbridge project.
 
 It exposes the WSGI callable as a module-level variable named ``application``.
 

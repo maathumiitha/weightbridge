@@ -12,8 +12,8 @@ import base64
 from decimal import Decimal
 
 from .models import (
-    Payment, QRCode, PaymentSlip, WeightRecord, 
-    CompanyDetails, WeightRecordPhoto, Operator
+    Payment, QRCode, PaymentSlip, WeightRecord,
+    CompanyDetails, WeightRecordPhoto, Operator, AuditLog
 )
 from .serializers import (
     PaymentSerializer, QRCodeSerializer, PaymentSlipSerializer,
@@ -21,6 +21,7 @@ from .serializers import (
 )
 from .utils import create_audit_log
 from .slip_generator import SlipGenerator  # We'll create this utility
+from .services.whatsapp_dispatcher import WhatsAppDispatchService
 
 
 class PaymentViewSet(viewsets.ModelViewSet):
@@ -391,11 +392,29 @@ class PaymentSlipViewSet(viewsets.ModelViewSet):
                     notes=f'Payment slip generated: {slip_number}'
                 )
                 
+                auto_send_enabled = bool(getattr(settings, "WHATSAPP_AUTO_SEND_ON_SLIP_GENERATE", False))
+                whatsapp_result = None
+                if auto_send_enabled:
+                    dispatch_result, phone, error_message = self._dispatch_whatsapp_for_slip(slip, request)
+                    if error_message:
+                        whatsapp_result = {
+                            "status": "FAILED",
+                            "message": error_message,
+                            "phone": phone,
+                        }
+                    else:
+                        whatsapp_result = {
+                            "status": dispatch_result.status,
+                            "message": dispatch_result.message,
+                            "phone": phone,
+                        }
+
                 return Response({
                     'status': 'success',
                     'message': 'Payment slip generated successfully',
                     'slip': PaymentSlipSerializer(slip).data,
-                    'pdf_url': slip.pdf_file.url if slip.pdf_file else None
+                    'pdf_url': slip.pdf_file.url if slip.pdf_file else None,
+                    'whatsapp': whatsapp_result,
                 }, status=status.HTTP_201_CREATED)
                 
         except Exception as e:
@@ -554,6 +573,133 @@ class PaymentSlipViewSet(viewsets.ModelViewSet):
         response['Content-Disposition'] = f'attachment; filename="{slip.slip_number}.pdf"'
         
         return response
+
+    @action(detail=True, methods=['post'])
+    def send_whatsapp(self, request, slip_id=None):
+        """
+        Send generated slip PDF to customer WhatsApp (provider or virtual queue).
+        """
+        slip = self.get_object()
+        dispatch_result, phone, error_message = self._dispatch_whatsapp_for_slip(slip, request)
+        if error_message:
+            return Response(
+                {
+                    "status": "FAILED",
+                    "message": error_message,
+                    "slip_id": str(slip.slip_id),
+                    "phone": phone,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if dispatch_result.status == "FAILED":
+            return Response(
+                {
+                    "status": dispatch_result.status,
+                    "message": dispatch_result.message,
+                    "slip_id": str(slip.slip_id),
+                    "phone": phone,
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(
+            {
+                "status": dispatch_result.status,
+                "message": dispatch_result.message,
+                "slip_id": str(slip.slip_id),
+                "phone": phone,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'])
+    def retry_whatsapp(self, request, slip_id=None):
+        """
+        Retry WhatsApp send for a slip.
+        """
+        return self.send_whatsapp(request, slip_id=slip_id)
+
+    @action(detail=True, methods=['get'])
+    def whatsapp_status(self, request, slip_id=None):
+        """
+        Return latest WhatsApp dispatch status for this slip.
+        """
+        slip = self.get_object()
+        marker = f"[WHATSAPP] slip_id={slip.slip_id};"
+        latest = (
+            AuditLog.objects.filter(
+                weight_record=slip.payment.weight_record,
+                payment=slip.payment,
+                notes__contains=marker,
+            )
+            .order_by("-timestamp")
+            .first()
+        )
+
+        if not latest:
+            return Response(
+                {
+                    "slip_id": str(slip.slip_id),
+                    "status": "NOT_SENT",
+                    "message": "No WhatsApp attempt found for this slip",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        status_value = None
+        if isinstance(latest.new_values, dict):
+            status_value = latest.new_values.get("status")
+        if not status_value:
+            status_value = "UNKNOWN"
+
+        return Response(
+            {
+                "slip_id": str(slip.slip_id),
+                "status": status_value,
+                "timestamp": latest.timestamp,
+                "notes": latest.notes,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def _dispatch_whatsapp_for_slip(self, slip, request):
+        weight_record = slip.payment.weight_record
+        customer = weight_record.customer
+        phone = (customer.driver_phone or "").strip()
+
+        if not phone:
+            return None, phone, "Customer driver_phone is missing"
+        if not slip.pdf_file:
+            return None, phone, "Slip PDF not found. Generate slip PDF before sending."
+
+        pdf_url = request.build_absolute_uri(slip.pdf_file.url)
+        dispatcher = WhatsAppDispatchService()
+        dispatch_result = dispatcher.send_slip(
+            to_phone=phone,
+            pdf_url=pdf_url,
+            slip_number=slip.slip_number,
+            customer_name=customer.driver_name,
+        )
+
+        create_audit_log(
+            weight_record=weight_record,
+            payment=slip.payment,
+            action="UPDATE",
+            request=request,
+            new_values={
+                "channel": "WHATSAPP",
+                "slip_id": str(slip.slip_id),
+                "status": dispatch_result.status,
+                "delivery_id": dispatch_result.delivery_id,
+                "provider_response": dispatch_result.provider_response,
+            },
+            notes=(
+                f"[WHATSAPP] slip_id={slip.slip_id}; status={dispatch_result.status}; "
+                f"message={dispatch_result.message}"
+            ),
+        )
+        return dispatch_result, phone, None
 
 
 class WeightRecordPhotoViewSet(viewsets.ModelViewSet):

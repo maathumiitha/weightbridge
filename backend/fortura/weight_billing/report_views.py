@@ -28,6 +28,16 @@ from .models_security_data_management import log_security_action
 class ReportViewSet(viewsets.ViewSet):
     """ViewSet for generating reports with security audit logging"""
     permission_classes = [IsAuthenticated]
+
+    @staticmethod
+    def _to_float(value, default=0.0):
+        """Safely convert Decimal/None values to float for export rendering."""
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
     
     def _build_filters(self, data):
         """Helper to build query filters"""
@@ -47,7 +57,10 @@ class ReportViewSet(viewsets.ViewSet):
         if 'customer' in data:
             filters &= Q(customer_id=data['customer'])
         if 'operator' in data:
-            filters &= Q(operator_id=data['operator'])
+            filters &= (
+                Q(operator_first_weight_id=data['operator']) |
+                Q(operator_second_weight_id=data['operator'])
+            )
         return filters
     
     @action(detail=False, methods=['post'])
@@ -95,19 +108,25 @@ class ReportViewSet(viewsets.ViewSet):
         detailed_records = []
         for record in records:
             detailed_records.append({
+                'slip_number': record.slip_number,
                 'date': record.date,
                 'shift': record.shift,
                 'vehicle_number': record.vehicle.vehicle_number,
                 'customer_driver_name': record.customer.driver_name,
-                'operator_first_weight_name': record.operator_first_weight.employee_name if record.operator_first_weight else None,
-                'operator_second_weight_name': record.operator_second_weight.employee_name if record.operator_second_weight else None,
-                'gross_weight': record.gross_weight,
-                'tare_weight': record.tare_weight,
-                'net_weight': record.net_weight,
-                'material_type': record.material_type,
-                'rate_per_unit': record.rate_per_unit,
-                'total_amount': record.total_amount,
-                'remarks': record.remarks
+                'operator_first_weight_name': record.operator_first_weight.employee_name if record.operator_first_weight else '',
+                'operator_second_weight_name': record.operator_second_weight.employee_name if record.operator_second_weight else '',
+                'first_weight': record.first_weight or 0,
+                'first_weight_time': record.first_weight_time or record.created_at,
+                'second_weight': record.second_weight,
+                'second_weight_time': record.second_weight_time,
+                'gross_weight': record.gross_weight or 0,
+                'tare_weight': record.tare_weight or 0,
+                'net_weight': record.net_weight or 0,
+                'material_type': record.material_type or '',
+                'rate_per_unit': record.rate_per_unit or 0,
+                'total_amount': record.total_amount or 0,
+                'status': record.status,
+                'remarks': record.remarks or ''
             })
         
         response_data = {
@@ -178,14 +197,14 @@ class ReportViewSet(viewsets.ViewSet):
             ws.cell(row=row, column=4, value=record.customer.driver_name)
             ws.cell(row=row, column=5, value=record.operator_first_weight.employee_name if record.operator_first_weight else '')
             ws.cell(row=row, column=6, value=record.operator_second_weight.employee_name if record.operator_second_weight else '')
-            ws.cell(row=row, column=7, value=float(record.gross_weight))
-            ws.cell(row=row, column=8, value=float(record.tare_weight))
-            ws.cell(row=row, column=9, value=float(record.net_weight))
-            ws.cell(row=row, column=10, value=record.material_type)
-            ws.cell(row=row, column=11, value=float(record.rate_per_unit))
-            ws.cell(row=row, column=12, value=float(record.total_amount))
+            ws.cell(row=row, column=7, value=self._to_float(record.gross_weight))
+            ws.cell(row=row, column=8, value=self._to_float(record.tare_weight))
+            ws.cell(row=row, column=9, value=self._to_float(record.net_weight))
+            ws.cell(row=row, column=10, value=record.material_type or '')
+            ws.cell(row=row, column=11, value=self._to_float(record.rate_per_unit))
+            ws.cell(row=row, column=12, value=self._to_float(record.total_amount))
             ws.cell(row=row, column=13, value='Yes' if record.is_multi_drop else 'No')
-            ws.cell(row=row, column=14, value=record.remarks)
+            ws.cell(row=row, column=14, value=record.remarks or '')
         
         # Add totals
         aggregates = records.aggregate(
@@ -289,12 +308,12 @@ class ReportViewSet(viewsets.ViewSet):
                 record.customer.driver_name,
                 record.operator_first_weight.employee_name if record.operator_first_weight else '',
                 record.operator_second_weight.employee_name if record.operator_second_weight else '',
-                f"{record.gross_weight:.2f}",
-                f"{record.tare_weight:.2f}",
-                f"{record.net_weight:.2f}",
-                record.material_type,
-                f"{record.rate_per_unit:.2f}",
-                f"{record.total_amount:.2f}"
+                f"{self._to_float(record.gross_weight):.2f}",
+                f"{self._to_float(record.tare_weight):.2f}",
+                f"{self._to_float(record.net_weight):.2f}",
+                record.material_type or '',
+                f"{self._to_float(record.rate_per_unit):.2f}",
+                f"{self._to_float(record.total_amount):.2f}"
             ])
         
         # Add totals

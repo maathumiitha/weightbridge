@@ -1,0 +1,44 @@
+.placeholder-page {
+  position: relative;
+  min-height: 100vh;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at top left, rgba(113, 224, 195, 0.18), transparent 26%),
+    radial-gradient(circle at right center, rgba(126, 195, 255, 0.16), transparent 24%),
+    linear-gradient(135deg, #edfdf7, #eef7ff);
+}
+
+.placeholder-shell {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+}
+
+.placeholder-card {
+  margin: 24px;
+  padding: 32px;
+  border-radius: 22px;
+  background: rgba(247, 255, 252, 0.8);
+  backdrop-filter: blur(10px);
+}
+
+.placeholder-eyebrow {
+  margin: 0 0 8px;
+  color: #178974;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.placeholder-card h1 {
+  margin: 0 0 10px;
+  color: #0f5e77;
+}
+
+.placeholder-card p {
+  margin: 0;
+  color: #245869;
+  max-width: 720px;
+  line-height: 1.6;
+}
